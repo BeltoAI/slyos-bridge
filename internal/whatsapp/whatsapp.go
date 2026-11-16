@@ -297,6 +297,7 @@ func (s *Session) handle(ctx context.Context, cli *whatsmeow.Client, evt any) {
 		if !ok {
 			return
 		}
+		s.enrichDirectPeer(ctx, e.Info.Chat, self, cli.Store.GetLID(), &in)
 		if in.Direction == "inbound" {
 			_ = s.vault.Put(ctx, "chats", in.ChatID, []byte{1})
 		}

@@ -135,9 +135,13 @@ type Inbound struct {
 	SentAt            time.Time `json:"sentAt"`
 	SenderID          string    `json:"senderId,omitempty"`
 	SenderName        string    `json:"senderName,omitempty"`
-	ThreadKind        string    `json:"threadKind"` // "direct" | "group"
-	ChatTitle         string    `json:"chatTitle,omitempty"`
-	MentionsMe        bool      `json:"mentionsMe,omitempty"`
+	// Provider-resolved other person in an outgoing direct conversation. Never
+	// the sender, and never inferred from message text or a display name.
+	RecipientID   string `json:"recipientId,omitempty"`
+	RecipientName string `json:"recipientName,omitempty"`
+	ThreadKind    string `json:"threadKind"` // "direct" | "group"
+	ChatTitle     string `json:"chatTitle,omitempty"`
+	MentionsMe    bool   `json:"mentionsMe,omitempty"`
 	// What this message carried that the bridge did not forward, e.g.
 	// "image". Phase 1 forwards text only and says so, rather than dropping
 	// a photo without a trace.
