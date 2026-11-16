@@ -36,6 +36,12 @@ type MediaSession interface {
 	DownloadMedia(context.Context, string, string) ([]byte, error)
 }
 
+// Optional durable delivery lookup. Only a receipt verified by the provider
+// session may bypass rate accounting; the request still passes all auth gates.
+type mediaReceiptSession interface {
+	MediaReceipt(context.Context, string, string, OutgoingMedia) (string, bool, error)
+}
+
 func (m *Manager) SendMedia(ctx context.Context, connID, chatID, text string, media OutgoingMedia, pressed bool) (string, error) {
 	if !pressed {
 		return "", ErrNotPressed
@@ -53,6 +59,11 @@ func (m *Manager) SendMedia(ctx context.Context, connID, chatID, text string, me
 	ms, ok := r.session.(MediaSession)
 	if !ok {
 		return "", ErrMediaUnavailable
+	}
+	if receipts, ok := r.session.(mediaReceiptSession); ok {
+		if id, found, err := receipts.MediaReceipt(ctx, chatID, text, media); found || err != nil {
+			return id, err
+		}
 	}
 	if err := m.limiter.Allow(connID, r.kind, chatID); err != nil {
 		return "", err

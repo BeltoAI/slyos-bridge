@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -41,7 +42,7 @@ func (f *fakeMedia) Download(_ context.Context, m whatsmeow.DownloadableMessage)
 func (f *fakeMedia) SendMessage(_ context.Context, _ types.JID, m *waE2E.Message, _ ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
 	f.sends++
 	f.msg = m
-	return whatsmeow.SendResponse{ID: "sent-media-1"}, f.sendErr
+	return whatsmeow.SendResponse{ID: fmt.Sprintf("sent-media-%d", f.sends)}, f.sendErr
 }
 
 func imageEvent() *events.Message {
@@ -212,5 +213,83 @@ func TestDownloadReaderRefusesUnboundedBody(t *testing.T) {
 	got, err := io.ReadAll(b)
 	if err == nil || len(got) != 3 {
 		t.Fatal("size limit ignored")
+	}
+}
+
+func TestReceiptLookupIsPayloadBoundAndSurvivesSessionRestart(t *testing.T) {
+	s, f := mediaSession(t)
+	ctx := context.Background()
+	in := file("application/pdf")
+	if _, found, err := s.MediaReceipt(ctx, "12345@s.whatsapp.net", "", in); found || err != nil {
+		t.Fatal("invented receipt", err)
+	}
+	id, err := s.SendMedia(ctx, "12345@s.whatsapp.net", "", in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := &Session{vault: s.vault, testMedia: f}
+	got, found, err := restarted.MediaReceipt(ctx, "12345@s.whatsapp.net", "", in)
+	if !found || err != nil || got != id || f.sends != 1 {
+		t.Fatal("receipt lost", err)
+	}
+	for _, change := range []struct {
+		chat, text string
+		media      session.OutgoingMedia
+	}{
+		{"other@s.whatsapp.net", "", in}, {"12345@s.whatsapp.net", "changed", in},
+		{"12345@s.whatsapp.net", "", session.OutgoingMedia{RequestID: in.RequestID, Filename: in.Filename, MimeType: in.MimeType, Bytes: []byte("other")}},
+	} {
+		if _, _, err := restarted.MediaReceipt(ctx, change.chat, change.text, change.media); !errors.Is(err, session.ErrInvalidMedia) {
+			t.Fatal("changed payload reused receipt", err)
+		}
+	}
+	other, _ := mediaSession(t)
+	if _, found, err := other.MediaReceipt(ctx, "12345@s.whatsapp.net", "", in); found || err != nil {
+		t.Fatal("cross-account receipt")
+	}
+}
+
+type mediaEventRecorder struct{ events []session.Inbound }
+
+func (r *mediaEventRecorder) Status(session.Status)         {}
+func (r *mediaEventRecorder) Message(event session.Inbound) { r.events = append(r.events, event) }
+
+func TestEverySentFileHasItsOwnReplayableTranscriptEvent(t *testing.T) {
+	s, f := mediaSession(t)
+	s.st = session.Status{State: session.StateLinked, ExternalAccountID: "15551112222"}
+	recorder := &mediaEventRecorder{}
+	s.rep = recorder
+	ctx := context.Background()
+	first := file("video/mp4")
+	first.Filename = "first-clip.mp4"
+	if _, err := s.SendMedia(ctx, "12345@s.whatsapp.net", "Both clips", first); err != nil {
+		t.Fatal(err)
+	}
+	second := file("video/mp4")
+	second.RequestID = "22222222-2222-4333-8444-555555555555"
+	second.Filename = "second-clip.mp4"
+	if _, err := s.SendMedia(ctx, "12345@s.whatsapp.net", "", second); err != nil {
+		t.Fatal(err)
+	}
+	if len(recorder.events) != 2 {
+		t.Fatal("a sent batch file vanished without provider echo")
+	}
+	for i, event := range recorder.events {
+		if event.Direction != "outbound" || event.ChatID != "12345@s.whatsapp.net" || event.ExternalAccountID != "15551112222" || event.MessageID != fmt.Sprintf("sent-media-%d", i+1) {
+			t.Fatal("wrong account/chat/message", event)
+		}
+		if len(event.Attachments) != 1 || !strings.HasPrefix(event.Attachments[0].Reference, "wa1:") {
+			t.Fatal("sent file is not openable")
+		}
+	}
+	if recorder.events[0].Attachments[0].Filename != first.Filename || recorder.events[1].Attachments[0].Filename != second.Filename || recorder.events[1].Body != "" {
+		t.Fatal("batch name/caption changed")
+	}
+	saved := recorder.events[1]
+	if _, found, err := s.MediaReceipt(ctx, "12345@s.whatsapp.net", "", second); !found || err != nil {
+		t.Fatal(err)
+	}
+	if f.sends != 2 || len(recorder.events) != 3 || recorder.events[2].MessageID != saved.MessageID || recorder.events[2].Attachments[0].Reference != saved.Attachments[0].Reference {
+		t.Fatal("retry resent media or cannot dedupe its transcript")
 	}
 }

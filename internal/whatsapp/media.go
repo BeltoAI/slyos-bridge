@@ -201,28 +201,12 @@ func (s *Session) SendMedia(ctx context.Context, chat, text string, f session.Ou
 	// A retry after a dropped HTTP response must not send a second file.
 	s.mediaSendMu.Lock()
 	defer s.mediaSendMu.Unlock()
-	payload, _ := json.Marshal(struct {
-		Chat, Text, Name, Mime string
-		Voice                  bool
-		Hash                   [32]byte
-	}{chat, text, f.Filename, f.MimeType, f.Voice, sha256.Sum256(f.Bytes)})
-	digest := sha256.Sum256(payload)
-	fingerprint := hex.EncodeToString(digest[:])
-	var prior struct {
-		Fingerprint string
-		MessageID   string
+	fingerprint := mediaFingerprint(chat, text, f)
+	if id, found, err := s.MediaReceipt(ctx, chat, text, f); found || err != nil {
+		return id, err
 	}
-	if b, readErr := s.vault.Get(ctx, "media-sends", f.RequestID); readErr == nil {
-		if json.Unmarshal(b, &prior) != nil || prior.Fingerprint != fingerprint {
-			return "", session.ErrInvalidMedia
-		}
-		if prior.MessageID != "" {
-			return prior.MessageID, nil
-		}
-		return "", session.ErrMediaUncertain
-	} else if !errors.Is(readErr, sealed.ErrNotFound) {
-		return "", readErr
-	}
+	prior := storedMediaReceipt{Fingerprint: fingerprint}
+
 	typ := whatsmeow.MediaDocument
 	if mt == "image/jpeg" || mt == "image/png" {
 		typ = whatsmeow.MediaImage
@@ -263,9 +247,91 @@ func (s *Session) SendMedia(ctx context.Context, chat, text string, f session.Ou
 		return "", session.ErrMediaUncertain
 	}
 	prior.MessageID = res.ID
+	prior.Event = s.sentMediaEvent(ctx, jid, msg, res, f.Filename)
 	receipt, _ := json.Marshal(prior)
 	_ = s.vault.Put(ctx, "media-sends", f.RequestID, receipt)
+	if prior.Event != nil && s.rep != nil {
+		s.rep.Message(*prior.Event)
+	}
 	return res.ID, nil
+}
+
+type storedMediaReceipt struct {
+	Fingerprint string
+	MessageID   string
+	Event       *session.Inbound `json:",omitempty"`
+}
+
+func mediaFingerprint(chat, text string, f session.OutgoingMedia) string {
+	payload, _ := json.Marshal(struct {
+		Chat, Text, Name, Mime string
+		Voice                  bool
+		Hash                   [32]byte
+	}{chat, text, f.Filename, f.MimeType, f.Voice, sha256.Sum256(f.Bytes)})
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:])
+}
+
+// Returning a saved receipt is not another provider send. The manager checks
+// this before charging the per-message limiter, so a partly completed batch
+// can continue after a minute instead of consuming its whole allowance again.
+// The encrypted connection vault and full payload fingerprint bind the receipt
+// to exactly this account, chat, caption and file. Uncertain sends fail closed.
+func (s *Session) MediaReceipt(ctx context.Context, chat, text string, f session.OutgoingMedia) (string, bool, error) {
+	b, err := s.vault.Get(ctx, "media-sends", f.RequestID)
+	if errors.Is(err, sealed.ErrNotFound) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	var prior storedMediaReceipt
+	if json.Unmarshal(b, &prior) != nil || prior.Fingerprint != mediaFingerprint(chat, text, f) {
+		return "", true, session.ErrInvalidMedia
+	}
+	if prior.MessageID == "" {
+		return "", true, session.ErrMediaUncertain
+	}
+	// A lost Brain webhook or API response can recover on a receipt retry.
+	// The same provider message ID and sealed reference make ingest deduplicate it.
+	if prior.Event != nil && s.rep != nil {
+		s.rep.Message(*prior.Event)
+	}
+	return prior.MessageID, true, nil
+}
+
+// WhatsApp need not echo a message to the device that just sent it. Emit the
+// accepted media through the same ingest path as a provider echo, so every
+// batch file is visible/openable even before other linked devices sync back.
+func (s *Session) sentMediaEvent(ctx context.Context, chat types.JID, msg *waE2E.Message, res whatsmeow.SendResponse, filename string) *session.Inbound {
+	account := s.Status().ExternalAccountID
+	if account == "" {
+		return nil
+	}
+	self, selfLID := types.NewJID(account, types.DefaultUserServer), types.EmptyJID
+	s.mu.Lock()
+	cli := s.cli
+	s.mu.Unlock()
+	if cli != nil {
+		self, selfLID = cli.Store.GetJID(), cli.Store.GetLID()
+	}
+	sentAt := res.Timestamp
+	if sentAt.IsZero() {
+		sentAt = time.Now().UTC()
+	}
+	e := &events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{
+		Chat: chat, Sender: self, IsFromMe: true, IsGroup: chat.Server == types.GroupServer,
+	}, ID: res.ID, Timestamp: sentAt}, Message: msg}
+	in, ok := Normalize(e, self, selfLID)
+	if !ok {
+		return nil
+	}
+	s.enrichDirectPeer(ctx, chat, self, selfLID, &in)
+	s.attachMedia(e, &in)
+	if len(in.Attachments) == 1 {
+		in.Attachments[0].Filename = safeFilename(filename, in.Attachments[0].MimeType)
+	}
+	return &in
 }
 
 // Bound the encrypted response before whatsmeow's io.ReadAll, including a
