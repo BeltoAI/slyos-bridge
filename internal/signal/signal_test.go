@@ -38,6 +38,17 @@ type fakeProvider struct {
 	sent     []string
 	timers   []Timer
 	msgs     chan Message
+	// Contact discovery: number -> ACI. A number not here is not on Signal.
+	directory map[string]string
+	lookups   []string
+}
+
+func (f *fakeProvider) Lookup(_ context.Context, e164 string) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lookups = append(f.lookups, e164)
+	aci, ok := f.directory[e164]
+	return aci, ok, nil
 }
 
 func (f *fakeProvider) Account(context.Context) (Account, bool, error) {

@@ -12,7 +12,10 @@
 //
 //   - it never sends on its own: Send is reached only through the manager,
 //     which refuses anything a person did not press;
-//   - it replies only in chats that wrote to this account;
+//   - it replies only in chats that wrote to this account, or that a person
+//     started from SlyOS with one exact number (start.go: Signal's contact
+//     discovery finds the account, and starts are capped and spaced by
+//     ratelimit/start.go);
 //   - it never sends read receipts or typing, so the phone still shows what
 //     is unread;
 //   - disconnect unlinks the device at Signal, closes the account's database
@@ -133,6 +136,10 @@ type provider interface {
 	// ends the link (session.ErrLoggedOut).
 	Receive(ctx context.Context, deliver func(Message)) error
 	Send(ctx context.Context, chatID, text string, t Timer) (messageID string, err error)
+	// Lookup finds the Signal account a number in E.164 belongs to: its ACI,
+	// or found false when the number is not on Signal or its owner does not
+	// let people find them by number (start.go). Sends nothing.
+	Lookup(ctx context.Context, e164 string) (aci string, found bool, err error)
 	// Unlink asks Signal to remove this linked device.
 	Unlink(ctx context.Context) error
 }
@@ -321,7 +328,8 @@ func (s *Session) noteTimer(ctx context.Context, chat string, t Timer) {
 // SubmitCode: Signal links by QR only.
 func (s *Session) SubmitCode(context.Context, string, string) error { return session.ErrWrongState }
 
-// Send delivers one reply, only into a chat that wrote to this account.
+// Send delivers one message, only into a chat that wrote to this account or
+// one a person started from SlyOS (start.go).
 func (s *Session) Send(ctx context.Context, chat, text string) (string, error) {
 	s.mu.Lock()
 	p, linked := s.p, s.st.State == session.StateLinked
@@ -329,10 +337,10 @@ func (s *Session) Send(ctx context.Context, chat, text string) (string, error) {
 	if p == nil || !linked {
 		return "", session.ErrNotLinked
 	}
-	if _, err := s.vault.Get(ctx, nsChats, chat); errors.Is(err, sealed.ErrNotFound) {
-		return "", ErrUnknownChat
-	} else if err != nil {
+	if known, err := s.knownChat(ctx, chat); err != nil {
 		return "", err
+	} else if !known {
+		return "", ErrUnknownChat
 	}
 	var t Timer
 	if b, err := s.vault.Get(ctx, nsTimers, chat); err == nil {

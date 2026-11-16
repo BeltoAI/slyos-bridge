@@ -141,7 +141,8 @@ type Inbound struct {
 	// What this message carried that the bridge did not forward, e.g.
 	// "image". Phase 1 forwards text only and says so, rather than dropping
 	// a photo without a trace.
-	Unsupported string `json:"unsupported,omitempty"`
+	Unsupported string       `json:"unsupported,omitempty"`
+	Attachments []Attachment `json:"attachments,omitempty"`
 }
 
 // Reporter is how a session tells the manager what happened. The manager

@@ -16,6 +16,9 @@
 //     account through the bridge — the "messaging non-contacts in bulk"
 //     pattern, refused after a handful.
 //
+// And for a chat this account STARTS (start.go, 2026-10-23): StartsPerDay
+// brand-new chats a day, StartSpacing apart.
+//
 // In memory means a deploy resets the counters. That is acceptable for a pace
 // limit (a deploy takes longer than a minute) and is stated in the ADR rather
 // than discovered.
@@ -62,6 +65,7 @@ type state struct {
 	sends  []time.Time
 	firsts []time.Time
 	known  map[string]bool // chat ids that have written to this account
+	starts []time.Time     // brand-new chats started (start.go)
 }
 
 func New(now func() time.Time) *Limiter {
@@ -119,10 +123,20 @@ func (l *Limiter) Allow(conn, kind, chat string) error {
 	return nil
 }
 
-// Forget drops a connection's counters on revoke.
+// Forget drops a connection's counters on revoke — all but the chats it
+// started in the last 24 hours, so disconnecting and linking again is not a
+// way round StartsPerDay (start.go). Times only; nothing about who.
 func (l *Limiter) Forget(conn string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	s, ok := l.conns[conn]
+	if !ok {
+		return
+	}
+	if starts := trim(s.starts, l.now().Add(-24*time.Hour)); len(starts) > 0 {
+		l.conns[conn] = &state{limits: s.limits, known: map[string]bool{}, starts: starts}
+		return
+	}
 	delete(l.conns, conn)
 }
 

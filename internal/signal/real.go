@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -291,6 +292,41 @@ func (r *meow) Send(ctx context.Context, chat, text string, t Timer) (string, er
 		}
 	}
 	return MessageID(cli.Store.ACI.String(), ts), nil
+}
+
+// Lookup turns a number into the ACI of the Signal account it belongs to, the
+// way mautrix-signal's resolvePhone does: the store's own record of the number
+// first, then Signal's contact discovery (CDSI). Needs the live connection the
+// receive loop holds. Found is false for a number not on Signal, or whose
+// owner does not let people find them by number — Signal does not say which.
+func (r *meow) Lookup(ctx context.Context, e164 string) (string, bool, error) {
+	r.mu.Lock()
+	cli := r.cli
+	r.mu.Unlock()
+	if cli == nil {
+		return "", false, session.ErrNotLinked
+	}
+	ctx = r.log.WithContext(ctx)
+	if rec, err := cli.ContactByE164(ctx, e164); err == nil && rec != nil && rec.ACI != uuid.Nil &&
+		!cli.Store.RecipientStore.IsUnregistered(ctx, libsignalgo.NewACIServiceID(rec.ACI)) {
+		return rec.ACI.String(), true, nil
+	}
+	number, err := strconv.ParseUint(strings.TrimPrefix(e164, "+"), 10, 64)
+	if err != nil {
+		return "", false, &session.RecipientError{Reason: session.RecipientBadShape}
+	}
+	found, err := cli.LookupPhone(ctx, number)
+	if err != nil {
+		var limited signalmeow.ContactDiscoveryRateLimitError
+		if errors.As(err, &limited) {
+			return "", false, &session.RecipientError{Reason: session.RecipientProviderLimited, RetryAfter: limited.RetryAfter}
+		}
+		return "", false, errors.New("signal: contact discovery failed")
+	}
+	if aci := found[number].ACI; aci != uuid.Nil {
+		return aci.String(), true, nil
+	}
+	return "", false, nil
 }
 
 // Unlink removes this device from the account's Linked devices, then the

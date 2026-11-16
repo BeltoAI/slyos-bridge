@@ -116,6 +116,13 @@ type Session struct {
 	st     bsession.Status
 	api    *tg.Client
 	selfID int64
+	// His own number's digits, from Telegram's answer about himself: only so
+	// a start to it is refused before anything is imported (start.go). In
+	// memory; never sealed, never logged.
+	selfPhone string
+	// Stands in for api when a chat is started (start.go), in tests only:
+	// there is no Telegram a test may import somebody's number into.
+	testRPC startAPI
 	// Set when a login ends, however it ends: from then on SubmitCode takes
 	// nothing, so no code or password can be left waiting in a channel for
 	// the life of the session. login() clears it when a login begins.
@@ -203,6 +210,7 @@ func (s *Session) Run(ctx context.Context) error {
 		s.mu.Lock()
 		s.api = c.API()
 		s.selfID = self.ID
+		s.selfPhone = bsession.Digits(self.Phone)
 		s.mu.Unlock()
 		s.opts.Resume = true // a restart after this point resumes, never re-pairs
 		s.set(bsession.Status{
@@ -522,13 +530,12 @@ func (s *Session) onMessage(ctx context.Context, e tg.Entities, mc tg.MessageCla
 	s.rep.Message(in)
 }
 
-// Send replies in a chat that has written to this account. A chat the bridge
-// has never seen has no stored peer, and is refused rather than resolved:
-// the bridge does not look people up to message them.
+// Send replies in a chat this account has: one that has written to it, or one
+// a person started from SlyOS (start.go, which looks the person up and stores
+// the peer). A chat the bridge has never seen has no stored peer and is
+// refused rather than resolved: an ordinary send never looks anybody up.
 func (s *Session) Send(ctx context.Context, chat, text string) (string, error) {
-	s.mu.Lock()
-	api := s.api
-	s.mu.Unlock()
+	api := s.rpcClient()
 	if api == nil {
 		return "", bsession.ErrNotLinked
 	}
@@ -553,6 +560,11 @@ func (s *Session) Send(ctx context.Context, chat, text string) (string, error) {
 	default:
 		return "", ErrUnknownPeer
 	}
+	return sendText(ctx, api, input, chat, text)
+}
+
+// sendText sends one message and answers with its id as the brain knows it.
+func sendText(ctx context.Context, api startAPI, input tg.InputPeerClass, chat, text string) (string, error) {
 	var rb [8]byte
 	if _, err := rand.Read(rb[:]); err != nil {
 		return "", err

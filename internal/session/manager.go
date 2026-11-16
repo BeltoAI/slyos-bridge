@@ -58,6 +58,18 @@ type Manager struct {
 	// race_test.go. A *sync.Mutex per id ever connected; never deleted, so a
 	// waiter can never be holding a lock somebody else has replaced.
 	connLocks sync.Map
+	// One lock per connection id held across a whole Start (start.go): the
+	// guard's check, the lookup and the send are one step, so two presses
+	// arriving together cannot both pass the 60-second spacing. Separate
+	// from connLocks so a slow provider lookup never holds up a Disconnect.
+	startLocks sync.Map
+}
+
+func (m *Manager) lockStart(connID string) (unlock func()) {
+	v, _ := m.startLocks.LoadOrStore(connID, &sync.Mutex{})
+	l := v.(*sync.Mutex)
+	l.Lock()
+	return l.Unlock
 }
 
 func (m *Manager) lockConn(connID string) (unlock func()) {
@@ -102,6 +114,9 @@ func init() {
 	logsafe.RegisterClass(ErrWrongState, "wrong_state")
 	logsafe.RegisterClass(ratelimit.ErrPerMinute, "rate_per_minute")
 	logsafe.RegisterClass(ratelimit.ErrPerDay, "rate_per_day")
+	logsafe.RegisterClass(ratelimit.ErrStartDaily, "start_limit_day")
+	logsafe.RegisterClass(ratelimit.ErrStartSpacing, "start_limit_spacing")
+	logsafe.RegisterClass(ErrCannotStart, "cannot_start")
 	logsafe.RegisterClass(ratelimit.ErrFirstContact, "rate_first_contact")
 	logsafe.RegisterClass(sealed.ErrOpen, "sealed_open_failed")
 	logsafe.RegisterClass(sealed.ErrDestroyed, "sealed_destroyed")
@@ -366,6 +381,98 @@ func (m *Manager) Send(ctx context.Context, connID, chatID, text string, pressed
 	}
 	m.count("sent")
 	return id, nil
+}
+
+// Started is what a chat started with somebody new answers to the brain.
+type Started struct {
+	ChatID      string `json:"chatId"`
+	MessageID   string `json:"messageId"`
+	RecipientID string `json:"recipientId"`
+	// False when the account already had a chat with them, so the start was
+	// an ordinary send and was not counted as a brand-new chat.
+	New bool `json:"new"`
+}
+
+// Start sends the first message to one exact person who has not written —
+// a number in E.164, or on Telegram an @username (start.go). In this order,
+// and each step refuses with nothing sent:
+//
+//  1. a person pressed it (ErrNotPressed), the connection is linked, and its
+//     kind can start chats at all (ErrCannotStart);
+//  2. THE BAN-RISK GUARD, before the provider is asked anything: a refusal
+//     names when the next start frees up (*ratelimit.StartError);
+//  3. the provider finds the person (a *RecipientError when it cannot);
+//  4. the guard and the send pace take the start atomically, and give it
+//     back if the provider then refuses the message.
+//
+// A start to somebody this account already has a chat with is an ordinary
+// send under the ordinary pace, and is not counted as a brand-new chat.
+// Serialised per connection, so two presses together cannot both pass the
+// spacing.
+func (m *Manager) Start(ctx context.Context, connID, to, text string, pressedByPerson bool) (Started, error) {
+	if !pressedByPerson {
+		m.count("refused_unpressed")
+		return Started{}, ErrNotPressed
+	}
+	r, err := m.get(connID)
+	if err != nil {
+		return Started{}, err
+	}
+	if r.session.Status().State != StateLinked {
+		return Started{}, ErrNotLinked
+	}
+	starter, ok := r.session.(Starter)
+	if !ok {
+		return Started{}, ErrCannotStart
+	}
+	defer m.lockStart(connID)()
+	if err := m.limiter.CanStart(connID, r.kind); err != nil {
+		m.count("refused_start_limit")
+		return Started{}, err
+	}
+	t, err := starter.Resolve(ctx, to)
+	if err != nil {
+		var refused *RecipientError
+		if errors.As(err, &refused) {
+			m.count("refused_recipient")
+			m.log.Info("start refused", slog.String("conn", connID), slog.String("kind", r.kind),
+				slog.String("reason", refused.Reason))
+		} else {
+			m.log.Warn("start lookup failed", slog.String("conn", connID), logsafe.Err(err))
+		}
+		return Started{}, err
+	}
+	if t.Release != nil {
+		defer func() {
+			rctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			t.Release(rctx)
+			cancel()
+		}()
+	}
+	undo := func() {}
+	if t.Known {
+		err = m.limiter.Allow(connID, r.kind, t.ChatID)
+	} else {
+		undo, err = m.limiter.AllowStart(connID, r.kind)
+	}
+	if err != nil {
+		m.count("refused_rate")
+		return Started{}, err
+	}
+	id, err := starter.SendTo(ctx, t, text)
+	if err != nil {
+		if !t.Known {
+			undo() // nothing was started, so nothing is counted as started
+		}
+		m.log.Warn("start send failed", slog.String("conn", connID), logsafe.Err(err))
+		return Started{}, err
+	}
+	if t.Known {
+		m.count("sent")
+	} else {
+		m.count("started")
+	}
+	return Started{ChatID: t.ChatID, MessageID: id, RecipientID: t.RecipientID, New: !t.Known}, nil
 }
 
 // Revoke is disconnect: unlink at the provider (best effort, bounded), stop

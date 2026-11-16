@@ -14,8 +14,11 @@
 //
 //   - it never sends on its own: Send is reached only through the manager,
 //     which refuses anything a person did not press;
-//   - it replies only in chats that wrote to this account (unknown chats
-//     are refused here, before the rate limiter is even asked);
+//   - it replies only in chats that wrote to this account, or that a person
+//     started from SlyOS with one exact number (start.go: the number is
+//     checked on WhatsApp first, and starts are capped and spaced by
+//     ratelimit/start.go); any other chat is refused here, before the rate
+//     limiter is even asked;
 //   - it never marks a chat read and never sets presence, so the phone
 //     still shows what is unread;
 //   - the retry store is off, so no outgoing plaintext is kept.
@@ -27,6 +30,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -101,6 +105,11 @@ type Session struct {
 	cli       *whatsmeow.Client
 	fatal     chan error
 	phoneSeen time.Time
+	// Stands in for cli when a chat is started (start.go), in tests only:
+	// there is no WhatsApp server a test may look a number up on.
+	testChat    chatter
+	testMedia   mediaClient
+	mediaSendMu sync.Mutex
 }
 
 func (s *Session) Status() session.Status {
@@ -175,6 +184,7 @@ func newClient(device *store.Device, log waLog.Logger) *whatsmeow.Client {
 	cli := whatsmeow.NewClient(device, log)
 	cli.UseRetryMessageStore = false
 	cli.ManualHistorySyncDownload = true
+	cli.SetMediaHTTPClient(&http.Client{Timeout: 45 * time.Second, Transport: boundedMediaTransport{base: http.DefaultTransport}})
 	return cli
 }
 
@@ -290,6 +300,7 @@ func (s *Session) handle(ctx context.Context, cli *whatsmeow.Client, evt any) {
 		if in.Direction == "inbound" {
 			_ = s.vault.Put(ctx, "chats", in.ChatID, []byte{1})
 		}
+		s.attachMedia(e, &in)
 		s.rep.Message(in)
 	case *events.Receipt:
 		self := cli.Store.GetJID()
@@ -340,16 +351,16 @@ func (s *Session) loadPhoneSeen(ctx context.Context) {
 func (s *Session) SubmitCode(context.Context, string, string) error { return session.ErrWrongState }
 
 func (s *Session) Send(ctx context.Context, chat, text string) (string, error) {
-	s.mu.Lock()
-	cli := s.cli
-	s.mu.Unlock()
+	cli := s.chatClient()
 	if cli == nil || !cli.IsLoggedIn() {
 		return "", session.ErrNotLinked
 	}
-	if _, err := s.vault.Get(ctx, "chats", chat); errors.Is(err, sealed.ErrNotFound) {
-		return "", ErrUnknownChat
-	} else if err != nil {
+	// A chat that wrote to this account, or one a person started from here
+	// (start.go) — a second message before they answer is an ordinary send.
+	if known, err := s.knownChat(ctx, chat); err != nil {
 		return "", err
+	} else if !known {
+		return "", ErrUnknownChat
 	}
 	jid, err := types.ParseJID(chat)
 	if err != nil {

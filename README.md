@@ -23,7 +23,11 @@ It is published under the GNU Affero General Public License v3.0 (see
   (`internal/logsafe`).
 - A send that no person pressed is refused here, a second time after the brain
   refused it, and sends are paced and limited to chats that wrote first
-  (`internal/session`, `internal/ratelimit`).
+  (`internal/session`, `internal/ratelimit`) — or that a person started from
+  SlyOS to one exact number or @username (`POST /v1/connections/{id}/start`,
+  2026-10-23): WhatsApp checks the number first, Telegram's imported contact
+  is removed afterwards, and at most 10 new chats a day, 60 s apart, per
+  account (`internal/ratelimit/start.go`).
 
 ## Libraries
 

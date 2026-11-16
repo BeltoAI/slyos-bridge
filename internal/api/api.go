@@ -8,12 +8,18 @@
 //	GET    /v1/connections/{id}            -> Status (live, or how it ended)
 //	POST   /v1/connections/{id}/code       {code?, password?} -> Status after Telegram answered
 //	POST   /v1/connections/{id}/send       {chatId, text, pressedByPerson, outboxId} -> {messageId}
+//	POST   /v1/connections/{id}/start      {to, text, pressedByPerson, outboxId}
+//	                                       -> {chatId, messageId, recipientId, new}
+//	                                       422 {error: not_on_whatsapp | not_on_telegram | not_on_signal
+//	                                            | not_a_person | own_account | bad_recipient}
+//	                                       429 {error: start_limit_day | start_limit_spacing
+//	                                            | provider_rate_limited, retryAfterSeconds}
 //	DELETE /v1/connections/{id}            -> 204, keys destroyed
 //	GET    /health                         -> counts
 //
-// Request bodies carry message text on /send and a phone number on connect.
-// Neither is logged; the access log line is method, route pattern, status and
-// milliseconds.
+// Request bodies carry message text on /send and /start, a phone number on
+// connect, and a number or @username on /start. None of it is logged; the
+// access log line is method, route pattern, status and milliseconds.
 package api
 
 import (
@@ -61,6 +67,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/connections/{id}", s.auth(s.status))
 	mux.HandleFunc("POST /v1/connections/{id}/code", s.auth(s.code))
 	mux.HandleFunc("POST /v1/connections/{id}/send", s.auth(s.send))
+	mux.HandleFunc("POST /v1/connections/{id}/send-media", s.auth(s.sendMedia))
+	mux.HandleFunc("POST /v1/connections/{id}/media", s.auth(s.downloadMedia))
+	mux.HandleFunc("POST /v1/connections/{id}/start", s.auth(s.start))
 	mux.HandleFunc("DELETE /v1/connections/{id}", s.auth(s.revoke))
 	return s.accessLog(mux)
 }
@@ -223,6 +232,61 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "unknown_connection")
 	case errors.Is(err, session.ErrNotLinked):
 		writeErr(w, http.StatusConflict, "not_linked")
+	case errors.Is(err, ratelimit.ErrPerMinute), errors.Is(err, ratelimit.ErrPerDay),
+		errors.Is(err, ratelimit.ErrFirstContact):
+		writeErr(w, http.StatusTooManyRequests, logsafe.Class(err))
+	default:
+		writeErr(w, http.StatusBadGateway, "provider_refused")
+	}
+}
+
+// start sends the first message to one exact person who has not written
+// (session.Manager.Start). `to` is one number in E.164 or one @username,
+// checked here before anything is looked up; which of the two a kind takes is
+// the session's to say (422 bad_recipient).
+func (s *Server) start(w http.ResponseWriter, r *http.Request) {
+	var b struct {
+		To              string `json:"to"`
+		Text            string `json:"text"`
+		PressedByPerson bool   `json:"pressedByPerson"`
+		OutboxID        string `json:"outboxId"`
+	}
+	if !readJSON(w, r, &b) {
+		return
+	}
+	if b.Text == "" {
+		writeErr(w, http.StatusBadRequest, "to_and_text_required")
+		return
+	}
+	if !session.E164.MatchString(b.To) && !session.TelegramUsername.MatchString(b.To) {
+		writeErr(w, http.StatusUnprocessableEntity, session.RecipientBadShape)
+		return
+	}
+	got, err := s.Manager.Start(r.Context(), r.PathValue("id"), b.To, b.Text, b.PressedByPerson)
+	var limited *ratelimit.StartError
+	var refused *session.RecipientError
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, got)
+	case errors.Is(err, session.ErrNotPressed):
+		writeErr(w, http.StatusForbidden, "not_pressed")
+	case errors.Is(err, session.ErrUnknownConnection):
+		writeErr(w, http.StatusNotFound, "unknown_connection")
+	case errors.Is(err, session.ErrNotLinked):
+		writeErr(w, http.StatusConflict, "not_linked")
+	case errors.Is(err, session.ErrCannotStart):
+		writeErr(w, http.StatusConflict, "cannot_start")
+	case errors.As(err, &limited):
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{
+			"error": logsafe.Class(err), "retryAfterSeconds": session.RetryAfterSeconds(limited.RetryAfter)})
+	case errors.As(err, &refused) && refused.Reason == session.RecipientProviderLimited:
+		body := map[string]any{"error": refused.Reason}
+		if refused.RetryAfter > 0 {
+			body["retryAfterSeconds"] = session.RetryAfterSeconds(refused.RetryAfter)
+		}
+		writeJSON(w, http.StatusTooManyRequests, body)
+	case errors.As(err, &refused):
+		writeErr(w, http.StatusUnprocessableEntity, refused.Reason)
 	case errors.Is(err, ratelimit.ErrPerMinute), errors.Is(err, ratelimit.ErrPerDay),
 		errors.Is(err, ratelimit.ErrFirstContact):
 		writeErr(w, http.StatusTooManyRequests, logsafe.Class(err))
